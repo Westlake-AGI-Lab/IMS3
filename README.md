@@ -1,6 +1,8 @@
 # [CVPR2026] ImS3: Breaking Distributional Aggregation in Diffusion-Based Dataset Distillation
 
-Reference implementation of **ImS3** (CVPR 2026) — [arXiv:2603.13960](https://arxiv.org/abs/2603.13960).
+Reference implementation of **ImS3** (CVPR 2026)
+
+[📄 Paper (arXiv)](https://arxiv.org/abs/2603.13960) &nbsp;
 
 > Diffusion-based dataset distillation tends to over-concentrate synthetic samples
 > in high-density regions of the data manifold, leaving boundary regions — which
