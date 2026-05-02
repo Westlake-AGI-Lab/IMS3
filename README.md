@@ -87,17 +87,6 @@ python sample.py --model DiT-XL/2 --image-size 256 \
     --ckpt <path/to/finetuned.pt> --save-dir <out> --spec woof
 ```
 
-## Reproduced result
-
-Configuration in `run.sh` (Imagewoof, IPC=10, ResNetAP-10, 1 seed, hard label):
-
-| Setting                                                                  | Top-1 |
-|--------------------------------------------------------------------------|------:|
-| Reproduced (this code, IM ckpt @ step 8000, S³ G=5/IPC=10/α=0.4/β=0.9, lr=0.1) | **42.7** |
-| Paper Table 1, ResNetAP-10, IPC=10                                       |  41.8 ± 0.3 |
-
-The paper averages over 3 seeds; the standard deviation alone covers the gap.
-
 ## Hyperparameters
 
 The defaults baked into `run.sh` are the ones we used to obtain the reproduced
