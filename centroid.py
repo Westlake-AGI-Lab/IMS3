@@ -305,7 +305,10 @@ def optimize_selection(
     C = len(cand_centroids)
     G = cand_centroids[0].size(0)
 
-    # 初始化：仅靠“贴近真实”项
+    # Warm-start init: pick the candidate subgroup whose centroid is closest to
+    # the real centroid for each class. The paper (Algorithm 2) describes a
+    # random init; we use closest-to-real as a deterministic warm start to
+    # speed up coordinate ascent without changing the final objective.
     selected = []
     for i in range(C):
         r_i = real_centroids[i].unsqueeze(0)         # (1,D)
@@ -406,17 +409,23 @@ def sample_one_group_for_one_class(
     cfg_scale: float,
     latent_size: int,
     k_per_group: int,
+    sample_batch: int = 0,
 ) -> torch.Tensor:
     """
-    Return tensor images: (K, 3, H, W) in [-1, 1]
+    Generate K images for a single class. Sampling is batched in chunks of
+    `sample_batch` (defaults to k_per_group, i.e. one batch per group).
+    Returns (K, 3, H, W) in [-1, 1].
     """
-    batch_size = 1
+    if sample_batch <= 0:
+        sample_batch = k_per_group
     images = []
-    for _ in range(k_per_group):
-        z = torch.randn(batch_size, 4, latent_size, latent_size, device=device)
-        y = torch.tensor([class_label], device=device)
+    remaining = k_per_group
+    while remaining > 0:
+        bs = min(sample_batch, remaining)
+        z = torch.randn(bs, 4, latent_size, latent_size, device=device)
+        y = torch.tensor([class_label] * bs, device=device)
         z = torch.cat([z, z], 0)
-        y_null = torch.tensor([1000] * batch_size, device=device)
+        y_null = torch.tensor([1000] * bs, device=device)
         y = torch.cat([y, y_null], 0)
         model_kwargs = dict(y=y, cfg_scale=cfg_scale)
         samples = diffusion.p_sample_loop(
@@ -425,9 +434,10 @@ def sample_one_group_for_one_class(
             progress=False, device=device
         )
         samples, _ = samples.chunk(2, dim=0)
-        img = vae.decode(samples / 0.18215).sample  # (1,3,H,W) in [-1,1]
-        images.append(img[0].detach().cpu())
-    return torch.stack(images, dim=0)  # (K,3,H,W)
+        imgs = vae.decode(samples / 0.18215).sample  # (bs,3,H,W) in [-1,1]
+        images.append(imgs.detach().cpu())
+        remaining -= bs
+    return torch.cat(images, dim=0)  # (K,3,H,W)
 
 # ----------------------------
 # Main
@@ -526,6 +536,7 @@ def main(args):
                 cfg_scale=args.cfg_scale,
                 latent_size=latent_size,
                 k_per_group=args.ipc,
+                sample_batch=args.sample_batch,
             )  # (K,3,H,W) in [-1,1]
             per_class_groups_imgs[class_id].append(imgs)
 
@@ -638,8 +649,8 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--num-sampling-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--ckpt", type=str, default="results/006-DiT-XL-2/checkpoints/0008000.pt",
-                        help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Path to a DiT checkpoint. For the full ImS3 method, this should be the IM-fine-tuned checkpoint produced by train_dit.py. If None, falls back to auto-downloading the pre-trained DiT-XL/2 (i.e. the +S3-only ablation).")
     parser.add_argument("--spec", type=str, default='woof', help='specific subset for generation')
     parser.add_argument("--save-dir", type=str, default='../logs/test', help='the root directory for outputs')
     parser.add_argument("--total-shift", type=int, default=0, help='index offset for the file name')
@@ -678,10 +689,12 @@ if __name__ == "__main__":
                         help="权重 α：贴近真实项（-log(d_real+eps)）系数")
     parser.add_argument("--w-sep", type=float, default=1.0,
                         help="权重 β：类间分离项（log(d_between+eps)）系数")
-    parser.add_argument("--sel-eps", type=float, default=0,
-                        help="log 的数值稳定项 eps")
+    parser.add_argument("--sel-eps", type=float, default=1e-6,
+                        help="log 的数值稳定项 eps（论文 Eq.(5)/(8) 中的 stability epsilon）")
     parser.add_argument("--sel-max-iters", type=int, default=5,
                         help="坐标上升最大轮数（每轮遍历所有类别，若无改进则提前停止）")
+    parser.add_argument("--sample-batch", type=int, default=0,
+                        help="diffusion sampling batch size per call (<=0 means use --ipc, i.e. one batch per subgroup)")
 
     args = parser.parse_args()
     main(args)

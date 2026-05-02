@@ -17,6 +17,7 @@ from misc.utils import random_indices, rand_bbox, AverageMeter, accuracy, get_ti
 from efficientnet_pytorch import EfficientNet
 import time
 import warnings
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 model_names = sorted(
@@ -118,7 +119,7 @@ def train(args, model, train_loader, val_loader, plotter=None, logger=None):
     logger(f"Start training with base augmentation and {args.mixup} mixup")
 
     # Start training and validation
-    for epoch in range(cur_epoch + 1, args.epochs + 1):
+    for epoch in tqdm(range(cur_epoch + 1, args.epochs + 1), desc="Epochs", leave=True):
         acc1_tr, _, loss_tr = train_epoch(args,
                                           train_loader,
                                           model,
@@ -140,8 +141,6 @@ def train(args, model, train_loader, val_loader, plotter=None, logger=None):
                 best_acc5 = acc5
                 if logger != None and args.verbose == True:
                     logger(f'Best accuracy (top-1 and 5): {best_acc1:.1f} {best_acc5:.1f}')
-                    print(f"WANDB_TOP1_BEST={np.mean(best_acc_l):.4f}")
-
 
         if args.save_ckpt and (is_best or (epoch == args.epochs)):
             state = {
@@ -177,7 +176,8 @@ def train_epoch(args,
 
     end = time.time()
     num_exp = 0
-    for i, (input, target) in enumerate(train_loader):
+    iterator = tqdm(train_loader, desc=f"Train epoch {epoch}", leave=False) if (logger is not None and args.verbose) else train_loader
+    for i, (input, target) in enumerate(iterator):
         if train_loader.device == 'cpu':
             input = input.cuda()
             target = target.cuda()
@@ -240,7 +240,8 @@ def validate(args, val_loader, model, criterion, epoch, logger=None):
     model.eval()
 
     end = time.time()
-    for i, (input, target) in enumerate(val_loader):
+    iterator = tqdm(val_loader, desc=f"Val epoch {epoch}", leave=False) if (logger is not None and args.verbose) else val_loader
+    for i, (input, target) in enumerate(iterator):
         input = input.cuda()
         target = target.cuda()
         output = model(input)
@@ -283,7 +284,7 @@ def load_checkpoint(path, model, optimizer):
         cur_epoch = 0
         best_acc1 = 100
 
-    return cur_epoch, best_acc1
+    return cur_epoch, best_acc1 
 
 
 def save_checkpoint(save_dir, state, is_best):
@@ -305,3 +306,4 @@ if __name__ == '__main__':
     logger(f"Save dir: {args.save_dir}")
 
     main(args, logger, args.repeat)
+    

@@ -20,6 +20,7 @@ from time import time
 import argparse
 import logging
 import os
+from tqdm import tqdm
 
 from data import ImageFolder
 from models import DiT_models
@@ -57,14 +58,18 @@ def cleanup():
     """
     End DDP training.
     """
-    dist.destroy_process_group()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    rank = 0
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+    if rank == 0:  # real logger
         logger = logging.getLogger(__name__)
         logger.propagate = False
         logger.setLevel(logging.INFO)
@@ -126,6 +131,33 @@ def mark_difffit_trainable(model, is_bitfit=False):
         par_tensor.requires_grad = any([kw in par_name for kw in trainable_names])
     return model
 
+@torch.no_grad()
+def ddim_inversion_step(diffusion, model, x_t, t, y=None):
+    """
+    Perform one-step DDIM reverse ODE: x_t -> x_{t+1} at the same index t (deterministic path).
+    Inputs:
+      - diffusion: gaussian diffusion object providing ddim_reverse_sample
+      - model: DiT model (possibly DDP wrapped)
+      - x_t: latent at timestep t (B, C, H, W)
+      - t: tensor of shape (B,) with current timesteps
+      - y: optional class conditioning tensor
+    Returns:
+      - x_{t+1} tensor of the same shape as x_t
+    """
+    mdl = model.module if hasattr(model, "module") else model
+    model_kwargs = {"y": y} if y is not None else None
+    out = diffusion.ddim_reverse_sample(
+        mdl,
+        x_t,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=model_kwargs,
+        eta=0.0,
+    )
+    return out["sample"]
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -136,15 +168,18 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
+    # Setup DDP (with single-process fallback)
+    dist_inited = False
+    if os.environ.get("RANK") is not None or os.environ.get("WORLD_SIZE") is not None:
+        dist.init_process_group("nccl")
+        dist_inited = True
+    world_size = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+    rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+    device = rank % max(1, torch.cuda.device_count())
+    seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
     # Setup an experiment folder:
     if rank == 0:
@@ -170,6 +205,10 @@ def main(args):
     )
     # Load pretrained model:
     ckpt_path = args.ckpt
+    if ckpt_path is None:
+        # Auto-download DiT pretrained matching image size
+        model_string_name = args.model.replace("/", "-")
+        ckpt_path = f"{model_string_name}-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict, strict=False)
     # Note that parameter initialization is done within the DiT constructor
@@ -182,7 +221,12 @@ def main(args):
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-3 in the Difffit paper):
     model = mark_difffit_trainable(model)
-    model = DDP(model.to(device), device_ids=[rank])
+    if dist_inited:
+        model = DDP(model.to(device), device_ids=[device])
+        ddp_wrapped = True
+    else:
+        model = model.to(device)
+        ddp_wrapped = False
     params_to_optimize = [p for p in model.parameters() if p.requires_grad]
     total_params = sum(p.numel() for p in params_to_optimize)
     print(f"Number of Trainable Parameters: {total_params * 1.e-6:.2f} M")
@@ -198,26 +242,36 @@ def main(args):
     dataset = ImageFolder(args.data_path, transform=transform, nclass=args.nclass,
                           ipc=args.finetune_ipc, spec=args.spec, phase=args.phase,
                           seed=0, return_origin=True)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+    if dist_inited:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=int(args.global_batch_size // world_size),
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=max(1, args.global_batch_size),
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    update_ema(ema, model.module if hasattr(model, "module") else model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
@@ -225,15 +279,18 @@ def main(args):
     train_steps = 0
     log_steps = 0
     running_loss, running_loss_pos, running_loss_neg = 0, 0, 0
+    running_loss_match = 0
     start_time = time()
     real_memory = defaultdict(list)
     pseudo_memory = defaultdict(list)
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
+        if dist_inited:
+            sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, ry, y in loader:
+        iter_obj = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False, ncols=100) if rank == 0 else loader
+        for x, ry, y in iter_obj:
             ry = ry.numpy()
             x = x.to(device)
             y = y.to(device)
@@ -244,13 +301,24 @@ def main(args):
             model_kwargs = dict(y=y)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             pseudo_embeddings = loss_dict["output"]
+            # one-step DDIM inversion using current t
+            x_ddim_inv = ddim_inversion_step(diffusion, model, x, t, y)
+            x_prev = loss_dict["x_prev"]
             loss = loss_dict["loss"].mean()
+
+            import torch.nn.functional as F
+            z1 = F.normalize(x_prev.flatten(1), dim=1)
+            z2 = F.normalize(x_ddim_inv.flatten(1), dim=1)
+            
+            # inverson matching
+            match_loss = (1 - args.lambda_match*cosine_similarity(z1, z2).mean())
+            # match_loss = args.lambda_match*cosine_similarity(z1, z2).mean()
 
             # Calculate minimax criteria
             pos_match_loss = torch.tensor(0.).to(device)
             neg_match_loss = torch.tensor(0.).to(device)
             if args.condense:
-                ry_set = set(ry)
+                ry_set = set(ry)    
                 num_ry = len(ry_set)
                 for c in ry_set:
                     if len(pseudo_memory[c]):
@@ -275,20 +343,21 @@ def main(args):
                     while len(pseudo_memory[c]) > args.memory_size:
                         pseudo_memory[c].pop(0)
 
-                all_loss = loss + pos_match_loss + neg_match_loss
-            else:
-                all_loss = loss
+                all_loss = loss  + pos_match_loss + neg_match_loss + match_loss
+            else: 
+                all_loss = loss + match_loss
 
             opt.zero_grad()
             all_loss.backward()
             opt.step()
-            update_ema(ema, model.module)
+            update_ema(ema, model.module if hasattr(model, "module") else model)
 
             # Log loss values:
             running_loss += loss.item()
             if pos_match_loss or neg_match_loss:
                 running_loss_pos += pos_match_loss.item()
                 running_loss_neg += neg_match_loss.item()
+            running_loss_match += match_loss.item()
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -300,17 +369,27 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 avg_loss_pos = torch.tensor(running_loss_pos / log_steps, device=device)
                 avg_loss_neg = torch.tensor(running_loss_neg / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                dist.all_reduce(avg_loss_pos, op=dist.ReduceOp.SUM)
-                dist.all_reduce(avg_loss_neg, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                avg_loss_pos = avg_loss_pos.item() / dist.get_world_size()
-                avg_loss_neg = avg_loss_neg.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} {avg_loss_pos:.4f} {avg_loss_neg:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                avg_loss_match = torch.tensor(running_loss_match / log_steps, device=device)
+                if dist_inited:
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_loss_pos, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_loss_neg, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_loss_match, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / world_size
+                    avg_loss_pos = avg_loss_pos.item() / world_size
+                    avg_loss_neg = avg_loss_neg.item() / world_size
+                    avg_loss_match = avg_loss_match.item() / world_size
+                else:
+                    avg_loss = avg_loss.item()
+                    avg_loss_pos = avg_loss_pos.item()
+                    avg_loss_neg = avg_loss_neg.item()
+                    avg_loss_match = avg_loss_match.item()
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} {avg_loss_pos:.4f} {avg_loss_neg:.4f} {avg_loss_match:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 running_loss_pos = 0
                 running_loss_neg = 0
+                running_loss_match = 0
                 log_steps = 0
                 start_time = time()
 
@@ -318,7 +397,7 @@ def main(args):
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args
@@ -326,7 +405,8 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+                if dist_inited:
+                    dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -338,28 +418,29 @@ def main(args):
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--data_path", type=str,default='../autodl-tmp/imagenette2/train')
+    parser.add_argument("--results_dir", type=str, default="/root/autodl-tmp/nette_ckpt")
     parser.add_argument("--tag", type=str, default="")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000, help='the class number for the total dataset')
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--global-batch-size", type=int, default=256)
-    parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--image_size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--num_classes", type=int, default=1000, help='the class number for the total dataset')
+    parser.add_argument("--epochs", type=int, default=11)
+    parser.add_argument("--global_batch_size", type=int, default=8)
+    parser.add_argument("--global_seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=500)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--log_every", type=int, default=500)
+    parser.add_argument("--ckpt_every", type=int, default=8000)
     parser.add_argument("--nclass", type=int, default=10, help='the class number for distillation training')
-    parser.add_argument("--finetune-ipc", type=int, default=1000, help='the number of samples participating in the fine-tuning')
-    parser.add_argument("--ckpt", type=str, default=None,
+    parser.add_argument("--finetune_ipc", type=int, default=-1, help='the number of samples participating in the fine-tuning')
+    parser.add_argument("--ckpt", type=str, default="pretrained_models/DiT-XL-2-256x256.pt",
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     parser.add_argument("--condense", action="store_true", default=False, help='whether conduct distillation')
-    parser.add_argument("--spec", type=str, default='none', help='specific subset for distillation')
-    parser.add_argument('--lambda-pos', default=0.002, type=float, help='weight for representativeness constraint')
-    parser.add_argument('--lambda-neg', default=0.008, type=float, help='weight for diversity constraint')
-    parser.add_argument("--memory-size", type=int, default=64, help='the memory size')
+    parser.add_argument("--spec", type=str, default='nette', help='specific subset for distillation')
+    parser.add_argument('--lambda_pos', default=0.002, type=float, help='weight for representativeness constraint')
+    parser.add_argument('--lambda_neg', default=0.008, type=float, help='weight for diversity constraint')
+    parser.add_argument("--memory_size", type=int, default=64, help='the memory size')
     parser.add_argument("--phase", type=int, default=0, help='the phase number for generating large datasets')
+    parser.add_argument('--lambda_match', default=0.002, type=float, help='weight for pseudo vs. ddim inversion match loss')
     args = parser.parse_args()
     main(args)

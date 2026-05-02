@@ -134,5 +134,7 @@ dmypy.json
 .pyre/
 data/
 pretrained_models/
-data/
-pretrained_models/
+
+# Local-only files (not part of release)
+CLAUDE.md
+DD_cvpr26.pdf
