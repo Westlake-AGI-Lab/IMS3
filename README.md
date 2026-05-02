@@ -1,12 +1,12 @@
-# [CVPR2026] ImS3: Breaking Distributional Aggregation in Diffusion-Based Dataset Distillation
+# [CVPR2026] IMS3: Breaking Distributional Aggregation in Diffusion-Based Dataset Distillation
 
-Reference implementation of **ImS3** (CVPR 2026)
+Reference implementation of **IMS3** (CVPR 2026)
 
 [📄 Paper (arXiv)](https://arxiv.org/abs/2603.13960) &nbsp;
 
 > Diffusion-based dataset distillation tends to over-concentrate synthetic samples
 > in high-density regions of the data manifold, leaving boundary regions — which
-> are crucial for classification — underrepresented. ImS3 addresses this with two
+> are crucial for classification — underrepresented. IMS3 addresses this with two
 > complementary strategies:
 >
 > - **Inversion-Matching (IM)**: a fine-tuning loss that aligns each training noise
@@ -30,7 +30,7 @@ Tested on a single NVIDIA H200 / A100 (40GB+) with PyTorch 2.4.1 + CUDA 12.1.
 
 ## Data
 
-ImS3 fine-tunes on a class-folder ImageNet subset and validates on the
+IMS3 fine-tunes on a class-folder ImageNet subset and validates on the
 corresponding real validation set. Layout:
 
 ```
@@ -137,3 +137,4 @@ The DiT backbone and diffusion utilities are adapted from
 [guided-diffusion](https://github.com/openai/guided-diffusion).
 The Stage-3 evaluator follows the protocol of
 [Minimax-Diffusion](https://github.com/vimar-gu/MinimaxDiffusion).
+We would also like to thank the amazing work of [RDED](https://github.com/LINs-lab/RDED/tree/main), [CaO2](https://github.com/hatchetProject/CaO2), and other related works for their inspiring and impactful contributions to this line of research.
